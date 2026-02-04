@@ -68,14 +68,7 @@ function createRoutes<const T extends readonly RouteDefinition[]>(
   const namedRoutes = buildNamedRoutes(defArray, options);
   const allRoutes = buildAllRoutes(defArray);
 
-  const proxy = createRootProxy(tree, options);
-
-  // Store metadata using Symbol for access by utility functions
-  Object.defineProperty(proxy, ROUTE_METADATA, {
-    value: { definitions, namedRoutes, allRoutes },
-    enumerable: false,
-    writable: false,
-  });
+  const proxy = createRootProxy(tree, options, { definitions, namedRoutes, allRoutes });
 
   return proxy as RouteTree<T>;
 }
@@ -220,7 +213,7 @@ function buildAllRoutes(definitions: RouteDefinition[]): RouteInfo[] {
 // Proxy Creation
 // ============================================
 
-function createRootProxy(tree: TreeNode, options: RoutishOptions): unknown {
+function createRootProxy(tree: TreeNode, options: RoutishOptions, metadata: { definitions: readonly RouteDefinition[]; namedRoutes: Map<string, NamedRoute>; allRoutes: RouteInfo[] }): unknown {
   const trailingSlash = options.trailingSlash ?? false;
   const paramNode = tree.children['$param'];
 
@@ -244,8 +237,15 @@ function createRootProxy(tree: TreeNode, options: RoutishOptions): unknown {
     throw new Error('Invalid arguments');
   };
 
+  // Store metadata on the function for proxy access
+  (fn as any)[ROUTE_METADATA] = metadata;
+
   return new Proxy(fn, {
-    get: (_, prop: string | symbol) => {
+    get: (target, prop: string | symbol) => {
+      // Handle ROUTE_METADATA symbol - return actual value from target
+      if (prop === ROUTE_METADATA) {
+        return (target as any)[ROUTE_METADATA];
+      }
       if (prop === '$index') {
         // Return the index route node with callable for query params
         const indexFn = (query?: QueryParams) => createIndexNode(query);
@@ -312,9 +312,10 @@ function createRouteNode(
 }
 
 function buildPath(segments: Segment[], query: QueryParams | undefined, trailingSlash: boolean): string {
-  const path = '/' + segments.map((s) => (s.type === 'static' ? s.name : s.value)).join('/') + (trailingSlash ? '/' : '');
-  if (!query || Object.keys(query).length === 0) return path;
-  return path + '?' + new URLSearchParams(Object.entries(query).map(([k, v]) => [k, String(v)])).toString();
+  // Root path is always just "/" (no double slash with trailingSlash)
+  const basePath = segments.length === 0 ? '/' : '/' + segments.map((s) => (s.type === 'static' ? s.name : s.value)).join('/') + (trailingSlash ? '/' : '');
+  if (!query || Object.keys(query).length === 0) return basePath;
+  return basePath + '?' + new URLSearchParams(Object.entries(query).map(([k, v]) => [k, String(v)])).toString();
 }
 
 function buildPattern(segments: Segment[], trailingSlash: boolean): string {
