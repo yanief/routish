@@ -6,12 +6,12 @@ A tiny, fully type-safe route builder for TypeScript. Define your routes once, g
 
 ## Features
 
-- 🎯 **Fully type-safe** — path params, query params, everything
-- 🔍 **Autocomplete** — your IDE knows all your routes
-- 🛡️ **Runtime validation** — optional Zod schemas for params
-- 📦 **Zero dependencies** — only Zod as optional peer dep
-- 🪶 **Tiny** — ~2KB minified
-- 🔌 **Framework agnostic** — works with React Router, Vue Router, or vanilla JS
+- **Fully type-safe** — path params, query params, everything
+- **Autocomplete** — your IDE knows all your routes
+- **Runtime validation** — optional schema validation for params
+- **Zero dependencies** — bring your own validation library
+- **Tiny** — ~2KB minified
+- **Framework agnostic** — works with React Router, Vue Router, or vanilla JS
 
 ## Installation
 
@@ -19,35 +19,37 @@ A tiny, fully type-safe route builder for TypeScript. Define your routes once, g
 npm install routish
 ```
 
-Routish has **zero dependencies**. Bring your own validation library (Zod, Valibot, ArkType) or use simple functions.
+Routish has **zero dependencies**. Bring your own validation library (Zod, Valibot, ArkType, Yup) or use simple functions.
 
 ## Quick Start
 
 ```typescript
-import { createRoutes } from 'routish';
+import { createRoutes, getRouteByName, getAllRoutes } from 'routish';
 import { z } from 'zod';
 
 const routes = createRoutes([
   '/',
   '/about',
   '/users/:userId',
-  { 
+  {
     path: '/users/:userId/posts/:postId',
-    params: { 
+    name: 'post',
+    params: {
       userId: z.string().uuid(),
       postId: z.coerce.number(),
     },
-    query: { 
+    query: {
       edit: z.enum(['true', 'false']).optional(),
     },
   },
 ]);
 
 // Generate URLs with full type safety
+routes.$index.toString()                   // "/" (root route)
 routes.about.toString()                    // "/about"
 routes.users('abc-123').toString()         // "/users/abc-123"
 routes.users('abc').posts(42).toString()   // "/users/abc/posts/42"
-routes.users('abc').posts(42, { edit: 'true' }).toString()  
+routes.users('abc').posts(42, { edit: 'true' }).toString()
 // "/users/abc/posts/42?edit=true"
 
 // Works in template literals
@@ -69,7 +71,7 @@ const routes = createRoutes([
   // Simple string routes
   '/about',
   '/contact',
-  
+
   // Routes with config
   {
     path: '/users/:userId',
@@ -97,27 +99,50 @@ Every route node has these methods:
 |--------|-------------|
 | `toString()` | Returns the URL string |
 | `toPattern()` | Returns the pattern (e.g., `/users/:userId`) |
-| `meta` | Access route metadata |
+| `getMeta()` | Returns route metadata (avoids collision with `/meta` paths) |
 
-### Named Routes
+### `$index` (Root Route)
 
-Access routes by name using `byName`:
+Access the root route (`/`) via the `$index` property:
 
 ```typescript
+const routes = createRoutes(['/', '/about']);
+
+routes.$index.toString()        // "/"
+routes.$index({ page: 1 })      // "/?page=1" (with query params)
+routes.about.toString()         // "/about"
+
+// In template literals
+const homeUrl = `${routes.$index}`;
+```
+
+**Note:** `routes.toString()` will throw an error. Always use `routes.$index` for the root route. This makes it explicit that `routes` is a container, not a route itself.
+
+### `getRouteByName(routes, name, params?, query?)`
+
+Access routes by name with type-safe parameters:
+
+```typescript
+import { createRoutes, getRouteByName } from 'routish';
+
 const routes = createRoutes([
   { path: '/users/:userId/posts/:postId', name: 'post' },
 ]);
 
-routes.byName.post({ userId: 'abc', postId: 123 }).toString()
+getRouteByName(routes, 'post', { userId: 'abc', postId: 123 }).toString()
 // "/users/abc/posts/123"
 ```
 
-### All Routes
+### `getAllRoutes(routes)`
 
 Get all route definitions for router registration:
 
 ```typescript
-routes.all.forEach(route => {
+import { createRoutes, getAllRoutes } from 'routish';
+
+const routes = createRoutes([...]);
+
+getAllRoutes(routes).forEach(route => {
   console.log(route.pattern, route.name, route.meta);
 });
 ```
@@ -128,10 +153,13 @@ routes.all.forEach(route => {
 
 ```tsx
 import { createBrowserRouter, Link } from 'react-router-dom';
+import { createRoutes, getAllRoutes } from 'routish';
+
+const routes = createRoutes([...]);
 
 // Register routes
 const router = createBrowserRouter(
-  routes.all.map(route => ({
+  getAllRoutes(routes).map(route => ({
     path: route.pattern,
     element: <Page />,
   }))
@@ -142,17 +170,20 @@ const router = createBrowserRouter(
 
 // Type-safe navigation
 const navigate = useNavigate();
-navigate(`${routes.users(userId).posts({ page: 1 })}`);
+navigate(`${routes.users(userId).posts(postId)}`);
 ```
 
 ### Vue Router
 
 ```typescript
 import { createRouter, createWebHistory } from 'vue-router';
+import { createRoutes, getAllRoutes } from 'routish';
+
+const routes = createRoutes([...]);
 
 const router = createRouter({
   history: createWebHistory(),
-  routes: routes.all.map(route => ({
+  routes: getAllRoutes(routes).map(route => ({
     path: route.pattern,
     name: route.name,
     meta: route.meta,
@@ -177,13 +208,13 @@ const res = await fetch(`/api${routes.users(userId)}`);
 // Window location
 window.location.href = `${routes.posts({ page: 2 })}`;
 
-// History API  
+// History API
 history.pushState(null, '', `${routes.users(userId)}`);
 ```
 
 ## Validation
 
-Routish is **validation-library agnostic**. Use Zod, Valibot, ArkType, or plain functions.
+Routish is **validation-library agnostic**. Use Zod, Valibot, ArkType, Yup, io-ts, or plain functions.
 
 ### With Zod
 
@@ -198,8 +229,8 @@ const routes = createRoutes([
   },
 ]);
 
-routes.users('valid-uuid').toString()  // ✓ Works
-routes.users('not-a-uuid')              // ✗ Throws ZodError
+routes.users('valid-uuid').toString()  // Works
+routes.users('not-a-uuid')              // Throws ZodError
 ```
 
 ### With Valibot
@@ -228,9 +259,6 @@ const routes = createRoutes([
     query: { page: yup.number().positive() },
   },
 ]);
-
-routes.users('valid-uuid').toString()  // ✓ Works
-routes.users(123)                       // ✗ Throws ValidationError
 ```
 
 ### With io-ts
@@ -247,7 +275,7 @@ const routes = createRoutes([
 ]);
 
 // io-ts decode() returns Either - routish handles this automatically
-routes.users('abc').toString()  // ✓ Works
+routes.users('abc').toString()  // Works
 ```
 
 ### With Custom Functions
@@ -256,7 +284,7 @@ routes.users('abc').toString()  // ✓ Works
 const routes = createRoutes([
   {
     path: '/posts/:postId',
-    params: { 
+    params: {
       postId: (v) => {
         const num = parseInt(v, 10);
         if (isNaN(num)) throw new Error('Invalid postId');
@@ -266,8 +294,8 @@ const routes = createRoutes([
   },
 ]);
 
-routes.posts(123).toString()    // ✓ "/posts/123"
-routes.posts('abc')             // ✗ Throws Error
+routes.posts(123).toString()    // "/posts/123"
+routes.posts('abc')             // Throws Error
 ```
 
 ### Parser Interface
@@ -291,7 +319,7 @@ type Parser = { decode: (value: unknown) => Either<Errors, T> };
 **Type safety for param names:**
 
 ```typescript
-// ✗ Type error — 'wrongName' doesn't exist in path
+// Type error — 'wrongName' doesn't exist in path
 {
   path: '/users/:userId',
   params: { wrongName: z.string() },
@@ -303,13 +331,17 @@ type Parser = { decode: (value: unknown) => Either<Errors, T> };
 Routish provides full type inference:
 
 ```typescript
-// Path params are typed based on Zod schema
-routes.posts(123)        // ✓ number accepted (z.coerce.number)
-routes.posts('abc')      // ✗ Type error if schema expects number
+// Path params are typed based on schema
+routes.posts(123)        // number accepted (z.coerce.number)
+routes.posts('abc')      // Type error if schema expects number
 
 // Query params are fully typed
-routes.users({ page: 1, sort: 'asc' })   // ✓
-routes.users({ invalid: true })           // ✗ Type error
+routes.users({ page: 1, sort: 'asc' })   // Works
+routes.users({ invalid: true })           // Type error
+
+// Named routes are type-safe
+getRouteByName(routes, 'post', { userId: 'abc', postId: 123 })  // Works
+getRouteByName(routes, 'invalid', {})  // Type error - 'invalid' not a valid name
 
 // Autocomplete works everywhere
 routes.users.  // IDE shows: posts, settings, ...

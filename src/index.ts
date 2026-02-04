@@ -4,7 +4,7 @@
  *
  * @example
  * ```ts
- * import { createRoutes } from 'routish';
+ * import { createRoutes, getRouteByName, getAllRoutes } from 'routish';
  *
  * // Without validation
  * const routes = createRoutes([
@@ -15,45 +15,44 @@
  * // With Zod
  * import { z } from 'zod';
  * const routes = createRoutes([
- *   { path: '/users/:userId', params: { userId: z.string().uuid() } },
+ *   { path: '/users/:userId', params: { userId: z.string().uuid() }, name: 'user' },
  * ]);
  *
- * // With Valibot
- * import * as v from 'valibot';
- * const routes = createRoutes([
- *   { path: '/users/:userId', params: { userId: v.parser(v.pipe(v.string(), v.uuid())) } },
- * ]);
+ * // Named route access
+ * getRouteByName(routes, 'user', { userId: 'abc-123' }).toString();
  *
- * // With custom parser
- * const routes = createRoutes([
- *   { path: '/posts/:postId', params: { postId: (v) => parseInt(v, 10) } },
- * ]);
+ * // Get all route definitions
+ * getAllRoutes(routes);
  * ```
  */
 
 import { runParser, createObjectParser } from './parser.js';
-import type {
-  Meta,
-  NamedRoute,
-  Parser,
-  ParserMap,
-  QueryParams,
-  RouteConfig,
-  RouteDefinition,
-  RouteInfo,
-  RouteNode,
-  RouteTree,
-  RoutishOptions,
-  Segment,
-  TreeNode,
-  ValidateDefinitions,
+import {
+  ROUTE_METADATA,
+  type ExtractNames,
+  type GetRouteByNameParams,
+  type GetRouteByNameQuery,
+  type Meta,
+  type NamedRoute,
+  type Parser,
+  type ParserMap,
+  type QueryParams,
+  type RouteConfig,
+  type RouteDefinition,
+  type RouteInfo,
+  type RouteNode,
+  type RouteTree,
+  type RoutishOptions,
+  type Segment,
+  type TreeNode,
+  type ValidateDefinitions,
 } from './types.js';
 
 // ============================================
 // Public API
 // ============================================
 
-export { createRoutes };
+export { createRoutes, getRouteByName, getAllRoutes };
 export type { RouteNode, RouteDefinition, RouteConfig, RouteInfo, RoutishOptions, Parser, ParserMap };
 
 // ============================================
@@ -64,16 +63,80 @@ function createRoutes<const T extends readonly RouteDefinition[]>(
   definitions: T & ValidateDefinitions<T>,
   options: RoutishOptions = {}
 ): RouteTree<T> {
-  const tree = buildTree([...definitions] as RouteDefinition[]);
-  const namedRoutes = buildNamedRoutes([...definitions] as RouteDefinition[], options);
-  const allRoutes = buildAllRoutes([...definitions] as RouteDefinition[]);
+  const defArray = [...definitions] as RouteDefinition[];
+  const tree = buildTree(defArray);
+  const namedRoutes = buildNamedRoutes(defArray, options);
+  const allRoutes = buildAllRoutes(defArray);
 
-  const proxy = createProxy([], undefined, tree, options, null);
+  const proxy = createRootProxy(tree, options);
 
-  Object.defineProperty(proxy, 'byName', { value: createNamedRoutesProxy(namedRoutes), enumerable: false });
-  Object.defineProperty(proxy, 'all', { value: allRoutes, enumerable: false });
+  // Store metadata using Symbol for access by utility functions
+  Object.defineProperty(proxy, ROUTE_METADATA, {
+    value: { definitions, namedRoutes, allRoutes },
+    enumerable: false,
+    writable: false,
+  });
 
   return proxy as RouteTree<T>;
+}
+
+// ============================================
+// Standalone Utility Functions
+// ============================================
+
+/**
+ * Get a route by its name with type-safe parameters
+ */
+function getRouteByName<T extends readonly RouteDefinition[], N extends ExtractNames<T>>(
+  routes: RouteTree<T>,
+  name: N,
+  params?: GetRouteByNameParams<T, N>,
+  query?: GetRouteByNameQuery<T, N>
+): RouteNode {
+  const metadata = routes[ROUTE_METADATA];
+  const route = metadata.namedRoutes.get(name as string);
+
+  if (!route) {
+    throw new Error(`Route "${name}" not found`);
+  }
+
+  let resolvedParams: Record<string, unknown> = (params as Record<string, unknown>) ?? {};
+  let resolvedQuery: QueryParams | undefined = query as QueryParams | undefined;
+
+  if (route.paramParser) {
+    resolvedParams = runParser(route.paramParser, resolvedParams) as Record<string, unknown>;
+  }
+  if (resolvedQuery && route.queryParser) {
+    resolvedQuery = runParser(route.queryParser, resolvedQuery) as QueryParams;
+  }
+
+  let path = route.pattern;
+  for (const p of route.paramNames) {
+    path = path.replace(`:${p}`, String(resolvedParams[p]));
+  }
+
+  if (route.options.trailingSlash && !path.endsWith('/')) {
+    path += '/';
+  }
+
+  if (resolvedQuery && Object.keys(resolvedQuery).length > 0) {
+    path += '?' + new URLSearchParams(Object.entries(resolvedQuery).map(([k, v]) => [k, String(v)])).toString();
+  }
+
+  return {
+    __segments: [],
+    __query: resolvedQuery,
+    getMeta: () => route.meta ?? undefined,
+    toString: () => path,
+    toPattern: () => route.pattern,
+  };
+}
+
+/**
+ * Get all route definitions
+ */
+function getAllRoutes<T extends readonly RouteDefinition[]>(routes: RouteTree<T>): RouteInfo[] {
+  return routes[ROUTE_METADATA].allRoutes;
 }
 
 // ============================================
@@ -81,24 +144,36 @@ function createRoutes<const T extends readonly RouteDefinition[]>(
 // ============================================
 
 function buildTree(definitions: RouteDefinition[]): TreeNode {
-  const root: TreeNode = { children: {}, paramName: null, paramParser: null, queryParser: null, meta: null };
+  const root: TreeNode = { children: {}, paramName: null, paramParser: null, queryParser: null, meta: null, isTerminal: false };
 
   for (const def of definitions) {
     const config = typeof def === 'string' ? { path: def } : def;
     let node = root;
 
-    for (const seg of config.path.split('/').filter(Boolean)) {
+    const segments = config.path.split('/').filter(Boolean);
+
+    // Handle root route "/"
+    if (segments.length === 0) {
+      root.isTerminal = true;
+      if (config.query) root.queryParser = createObjectParser(config.query);
+      if (config.meta) root.meta = config.meta;
+      continue;
+    }
+
+    for (const seg of segments) {
       const isParam = seg.startsWith(':');
       const key = isParam ? '$param' : seg;
       const paramName = isParam ? seg.slice(1) : null;
 
-      node = node.children[key] ??= { children: {}, paramName, paramParser: null, queryParser: null, meta: null };
+      node = node.children[key] ??= { children: {}, paramName, paramParser: null, queryParser: null, meta: null, isTerminal: false };
 
       if (isParam && config.params?.[paramName!]) {
         node.paramParser = config.params[paramName!] as Parser;
       }
     }
 
+    // Mark the final node as terminal
+    node.isTerminal = true;
     if (config.query) node.queryParser = createObjectParser(config.query);
     if (config.meta) node.meta = config.meta;
   }
@@ -145,43 +220,95 @@ function buildAllRoutes(definitions: RouteDefinition[]): RouteInfo[] {
 // Proxy Creation
 // ============================================
 
-function createNamedRoutesProxy(namedRoutes: Map<string, NamedRoute>): unknown {
-  return new Proxy(
-    {},
-    {
-      get: (_, name: string) => {
-        const route = namedRoutes.get(name);
-        if (!route) return undefined;
+function createRootProxy(tree: TreeNode, options: RoutishOptions): unknown {
+  const trailingSlash = options.trailingSlash ?? false;
+  const paramNode = tree.children['$param'];
 
-        return (paramsOrQuery?: Record<string, unknown>, maybeQuery?: QueryParams) => {
-          const hasParams = route.paramNames.length > 0;
-          let params: Record<string, unknown> = {};
-          let query: QueryParams | undefined;
+  // Create the $index route node (represents "/")
+  const createIndexNode = (query?: QueryParams): unknown => {
+    const validated = query && tree.queryParser ? runParser(tree.queryParser, query) : query;
+    return createRouteNode([], validated as QueryParams, tree.meta, trailingSlash);
+  };
 
-          if (hasParams) {
-            params = paramsOrQuery ?? {};
-            query = maybeQuery;
-          } else {
-            query = paramsOrQuery as QueryParams | undefined;
-          }
-
-          if (route.paramParser) params = runParser(route.paramParser, params) as Record<string, unknown>;
-          if (query && route.queryParser) query = runParser(route.queryParser, query) as QueryParams;
-
-          let path = route.pattern;
-          for (const p of route.paramNames) path = path.replace(`:${p}`, String(params[p]));
-
-          if (route.options.trailingSlash && !path.endsWith('/')) path += '/';
-
-          if (query && Object.keys(query).length > 0) {
-            path += '?' + new URLSearchParams(Object.entries(query).map(([k, v]) => [k, String(v)])).toString();
-          }
-
-          return { __segments: [], __query: query, meta: route.meta, toString: () => path, toPattern: () => route.pattern };
-        };
-      },
+  const fn = (valueOrQuery?: string | number | QueryParams, maybeQuery?: QueryParams) => {
+    if (typeof valueOrQuery === 'object') {
+      return createIndexNode(valueOrQuery);
     }
-  );
+    if (paramNode && (typeof valueOrQuery === 'string' || typeof valueOrQuery === 'number')) {
+      let value: string | number = valueOrQuery;
+      if (paramNode.paramParser) value = runParser(paramNode.paramParser, valueOrQuery) as string | number;
+      const newSegments = [{ type: 'param' as const, name: paramNode.paramName!, value: String(value) }];
+      const validated = maybeQuery && paramNode.queryParser ? runParser(paramNode.queryParser, maybeQuery) : maybeQuery;
+      return createProxy(newSegments, validated as QueryParams, paramNode, options, paramNode.meta);
+    }
+    throw new Error('Invalid arguments');
+  };
+
+  return new Proxy(fn, {
+    get: (_, prop: string | symbol) => {
+      if (prop === '$index') {
+        // Return the index route node with callable for query params
+        const indexFn = (query?: QueryParams) => createIndexNode(query);
+        return new Proxy(indexFn, {
+          get: (_, indexProp: string | symbol) => {
+            if (indexProp === '__segments') return [];
+            if (indexProp === '__query') return undefined;
+            if (indexProp === 'getMeta') return () => tree.meta ?? undefined;
+            if (indexProp === 'toString' || indexProp === Symbol.toStringTag) {
+              return () => {
+                if (!tree.isTerminal) {
+                  throw new Error('"/" is not a defined route. Define it explicitly: createRoutes([\'/\', ...])');
+                }
+                return buildPath([], undefined, trailingSlash);
+              };
+            }
+            if (indexProp === 'toPattern') {
+              return () => {
+                if (!tree.isTerminal) {
+                  throw new Error('"/" is not a defined route. Define it explicitly: createRoutes([\'/\', ...])');
+                }
+                return '/';
+              };
+            }
+            if (indexProp === 'then') return undefined;
+            return undefined;
+          },
+        });
+      }
+      if (prop === '__segments') return [];
+      if (prop === '__query') return undefined;
+      if (prop === 'getMeta') return () => tree.meta ?? undefined;
+      if (prop === 'toString' || prop === Symbol.toStringTag) {
+        return () => {
+          throw new Error('Cannot call toString() on routes directly. Use routes.$index for the root route.');
+        };
+      }
+      if (prop === 'toPattern') {
+        return () => {
+          throw new Error('Cannot call toPattern() on routes directly. Use routes.$index for the root route.');
+        };
+      }
+      if (prop === 'then') return undefined;
+      if (typeof prop === 'symbol') return undefined;
+      const child = tree.children[prop] ?? paramNode?.children[prop];
+      return child ? createProxy([{ type: 'static', name: prop }], undefined, child, options, child.meta) : undefined;
+    },
+  });
+}
+
+function createRouteNode(
+  segments: Segment[],
+  query: QueryParams | undefined,
+  meta: Meta | null,
+  trailingSlash: boolean
+): unknown {
+  return {
+    __segments: segments,
+    __query: query,
+    getMeta: () => meta ?? undefined,
+    toString: () => buildPath(segments, query, trailingSlash),
+    toPattern: () => buildPattern(segments, trailingSlash),
+  };
 }
 
 function buildPath(segments: Segment[], query: QueryParams | undefined, trailingSlash: boolean): string {
@@ -223,9 +350,25 @@ function createProxy(
     get: (_, prop: string | symbol) => {
       if (prop === '__segments') return segments;
       if (prop === '__query') return query;
-      if (prop === 'meta') return meta ?? tree.meta;
-      if (prop === 'toString' || prop === Symbol.toStringTag) return () => buildPath(segments, query, trailingSlash);
-      if (prop === 'toPattern') return () => buildPattern(segments, trailingSlash);
+      if (prop === 'getMeta') return () => (meta ?? tree.meta) ?? undefined;
+      if (prop === 'toString' || prop === Symbol.toStringTag) {
+        return () => {
+          if (!tree.isTerminal) {
+            const pattern = buildPattern(segments, false);
+            throw new Error(`"${pattern}" is not a defined route. Did you forget to add it to createRoutes()?`);
+          }
+          return buildPath(segments, query, trailingSlash);
+        };
+      }
+      if (prop === 'toPattern') {
+        return () => {
+          if (!tree.isTerminal) {
+            const pattern = buildPattern(segments, false);
+            throw new Error(`"${pattern}" is not a defined route. Did you forget to add it to createRoutes()?`);
+          }
+          return buildPattern(segments, trailingSlash);
+        };
+      }
       if (prop === 'then') return undefined;
       if (typeof prop === 'symbol') return undefined;
       const child = tree.children[prop] ?? paramNode?.children[prop];

@@ -99,15 +99,50 @@ export type Segment = { type: 'static'; name: string } | { type: 'param'; name: 
 export interface RouteNode {
   readonly __segments: Segment[];
   readonly __query?: QueryParams;
-  readonly meta?: Meta;
+  getMeta(): Meta | null | undefined;
   toString(): string;
   toPattern(): string;
 }
 
+/** Symbol used to store route metadata internally */
+export const ROUTE_METADATA = Symbol('routish.metadata');
+
+/** Internal metadata stored on the routes object */
+export interface RouteMetadata<T extends readonly RouteDefinition[] = readonly RouteDefinition[]> {
+  definitions: T;
+  namedRoutes: Map<string, NamedRoute>;
+  allRoutes: RouteInfo[];
+}
+
 export type RouteTree<T extends readonly RouteDefinition[]> = WrapNode<BuildTreeFromArray<T>> & {
-  byName: BuildNamedRoutes<T>;
-  all: RouteInfo[];
+  /** Access the root/index route (/) */
+  $index: RouteNode & ((query?: QueryParams) => RouteNode);
+  [ROUTE_METADATA]: RouteMetadata<T>;
 };
+
+// ============================================
+// Utility Function Types
+// ============================================
+
+/** Extract all route names from definitions */
+export type ExtractNames<T extends readonly RouteDefinition[]> = ExtractName<T[number]>;
+
+/** Get the named route config by name */
+type GetNamedConfig<T extends readonly RouteDefinition[], N extends string> = Extract<T[number], { name: N }>;
+
+/** Parameters for getRouteByName */
+export type GetRouteByNameParams<T extends readonly RouteDefinition[], N extends string> = SafeExtractParamNames<
+  GetNamedConfig<T, N>
+> extends never
+  ? undefined | void
+  : NamedRouteParams<GetNamedConfig<T, N>>;
+
+/** Query for getRouteByName */
+export type GetRouteByNameQuery<T extends readonly RouteDefinition[], N extends string> = ExtractQuery<
+  GetNamedConfig<T, N>
+> extends ParserMap
+  ? InferParserMap<ExtractQuery<GetNamedConfig<T, N>>>
+  : undefined;
 
 // ============================================
 // Internal Tree Building Types
@@ -147,29 +182,17 @@ type GetParamType<Params, ParamName extends string> = Params extends ParserMap
 // Named Routes Types
 // ============================================
 
-type BuildNamedRoutes<T extends readonly RouteDefinition[]> = {
-  [K in T[number] as ExtractName<K>]: NamedRouteFunction<K>;
-};
-
 type SafeExtractParamNames<T> = ExtractPath<T> extends string ? ExtractParamNames<ExtractPath<T>> : never;
 
-type NamedRouteFunction<T> = SafeExtractParamNames<T> extends never
-  ? ExtractQuery<T> extends ParserMap
-    ? (query?: InferParserMap<ExtractQuery<T>>) => RouteNodeWithMeta<ExtractMeta<T>>
-    : () => RouteNodeWithMeta<ExtractMeta<T>>
-  : ExtractQuery<T> extends ParserMap
-    ? (params: NamedRouteParams<T>, query?: InferParserMap<ExtractQuery<T>>) => RouteNodeWithMeta<ExtractMeta<T>>
-    : (params: NamedRouteParams<T>) => RouteNodeWithMeta<ExtractMeta<T>>;
+type ParamValue = string | number;
 
-type NamedRouteParams<T> = {
+export type NamedRouteParams<T> = {
   [K in SafeExtractParamNames<T>]: ExtractParams<T> extends ParserMap
     ? K extends keyof ExtractParams<T>
       ? ParserInput<ExtractParams<T>[K]>
-      : string
-    : string;
+      : ParamValue
+    : ParamValue;
 };
-
-type RouteNodeWithMeta<M> = RouteNode & { meta: M };
 
 type InferParserMap<T> = T extends ParserMap ? { [K in keyof T]: ParserOutput<T[K]> } : never;
 
@@ -178,23 +201,22 @@ type InferParserMap<T> = T extends ParserMap ? { [K in keyof T]: ParserOutput<T[
 // ============================================
 
 type InferQuery<S> = S extends ParserMap ? { [K in keyof S]: ParserOutput<S[K]> } : QueryParams;
-type InferParamInput<T> = T extends Parser<infer I, any> ? I : string;
+type InferParamInput<T> = T extends Parser<infer I, any> ? I : ParamValue;
 
 type Callable<C, Schema, ParamType> = {
-  (query: InferQuery<Schema>): WrapNode<C>;
   (value: InferParamInput<ParamType>, query?: InferQuery<Schema>): WrapNode<C>;
 };
 
 type ExtractSchema<T> = T extends { $schema: infer S } ? S : null;
-type ExtractMetaFromNode<T> = T extends { $meta: infer M } ? M : null;
 type ExtractParamType<T> = T extends { $paramType: infer P } ? P : null;
 
-type WrapNode<T> = RouteNode &
-  { meta: ExtractMetaFromNode<T> } & {
-    [K in keyof T as K extends '$call' | '$schema' | '$meta' | '$paramType' ? never : K]: WrapNode<T[K]>;
-  } & (T extends { $call: infer C }
-    ? Callable<DeepMerge<C, Omit<T, '$call' | '$schema' | '$meta' | '$paramType'>>, ExtractSchema<C>, ExtractParamType<T>>
-    : (query: InferQuery<ExtractSchema<T>>) => RouteNode);
+type WrapNode<T> = RouteNode & {
+  [K in keyof T as K extends '$call' | '$schema' | '$meta' | '$paramType' ? never : K]: WrapNode<T[K]>;
+} & (T extends { $call: infer C }
+  ? Callable<DeepMerge<C, Omit<T, '$call' | '$schema' | '$meta' | '$paramType'>>, ExtractSchema<C>, ExtractParamType<T>>
+    // If node is also terminal (has $schema), allow query-only calls for the static route
+    & (T extends { $schema: unknown } ? { (query?: InferQuery<ExtractSchema<T>>): RouteNode } : {})
+  : (query?: InferQuery<ExtractSchema<T>>) => RouteNode);
 
 type DeepMerge<A, B> = {
   [K in keyof A | keyof B]: K extends keyof A & keyof B
@@ -216,6 +238,7 @@ export interface TreeNode {
   paramParser: Parser<any, any> | null;
   queryParser: Parser<any, any> | null;
   meta: Meta | null;
+  isTerminal: boolean;
 }
 
 export interface NamedRoute {
